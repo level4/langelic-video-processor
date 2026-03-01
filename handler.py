@@ -77,12 +77,14 @@ def _process(event):
         segment_pattern = os.path.join(output_dir, "segment_%03d.m4s")
 
         audio_inputs = ["-i", audio_path] if audio_path else []
+        # Explicit stream mapping when muxing separate audio
+        map_args = ["-map", "0:v:0", "-map", "1:a:0"] if audio_path else []
 
         cmd = [
             "ffmpeg",
             "-hwaccel", "cuda",
             "-i", input_path,
-        ] + audio_inputs + [
+        ] + audio_inputs + map_args + [
             "-c:v", "h264_nvenc",
             "-preset", preset,
             "-rc", "constqp",
@@ -103,8 +105,9 @@ def _process(event):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
 
         if result.returncode != 0:
-            print(f"FFmpeg stderr: {result.stderr[-1000:]}")
-            return {"error": f"FFmpeg failed with code {result.returncode}"}
+            stderr_tail = result.stderr[-1000:] if result.stderr else "(no stderr)"
+            print(f"FFmpeg stderr: {stderr_tail}")
+            return {"error": f"FFmpeg failed with code {result.returncode}: {stderr_tail}"}
 
         print("FFmpeg complete")
 
