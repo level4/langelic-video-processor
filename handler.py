@@ -1,7 +1,8 @@
 """
 RunPod serverless handler for GPU-accelerated video processing.
 Downloads source video, re-encodes with NVENC + segments to HLS,
-uploads results to R2.
+uploads results to R2. Falls back to software encoding (libx264)
+if the GPU doesn't support the required NVENC features.
 """
 
 import os
@@ -72,7 +73,7 @@ def _process(event):
             except requests.RequestException as e:
                 return {"error": f"Audio download failed: {e}"}
 
-        # 2. Re-encode with NVENC + output HLS segments
+        # 2. Re-encode + output HLS segments
         stream_path = os.path.join(output_dir, "stream.m3u8")
         segment_pattern = os.path.join(output_dir, "segment_%03d.m4s")
 
@@ -80,17 +81,7 @@ def _process(event):
         # Explicit stream mapping when muxing separate audio
         map_args = ["-map", "0:v:0", "-map", "1:a:0"] if audio_path else []
 
-        cmd = [
-            "ffmpeg",
-            "-hwaccel", "cuda",
-            "-i", input_path,
-        ] + audio_inputs + map_args + [
-            "-c:v", "h264_nvenc",
-            "-preset", preset,
-            "-rc", "constqp",
-            "-qp", crf,
-            "-force_key_frames", f"expr:gte(t,n_forced*{keyframe_interval})",
-            "-c:a", "aac",
+        hls_args = [
             "-f", "hls",
             "-hls_time", segment_duration,
             "-hls_segment_type", "fmp4",
@@ -101,8 +92,24 @@ def _process(event):
             stream_path,
         ]
 
-        print(f"Running FFmpeg: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        # Try NVENC first, fall back to libx264 if GPU doesn't support it
+        result = _try_nvenc(
+            input_path, audio_inputs, map_args, hls_args,
+            preset, crf, keyframe_interval,
+        )
+
+        if result.returncode != 0:
+            stderr_tail = result.stderr[-1000:] if result.stderr else ""
+            if "NVENC" in stderr_tail or "not support" in stderr_tail:
+                print(f"NVENC failed, falling back to libx264: {stderr_tail[-200:]}")
+                # Clean output dir for retry
+                for f in glob.glob(os.path.join(output_dir, "*")):
+                    os.remove(f)
+
+                result = _try_libx264(
+                    input_path, audio_inputs, map_args, hls_args,
+                    crf, keyframe_interval,
+                )
 
         if result.returncode != 0:
             stderr_tail = result.stderr[-1000:] if result.stderr else "(no stderr)"
@@ -148,6 +155,42 @@ def _process(event):
             "segment_count": len(output_files) - 1,  # exclude manifest
             "output_files": output_files,
         }
+
+
+def _try_nvenc(input_path, audio_inputs, map_args, hls_args, preset, crf, keyframe_interval):
+    """Try GPU-accelerated encoding with NVENC."""
+    cmd = [
+        "ffmpeg",
+        "-hwaccel", "cuda",
+        "-i", input_path,
+    ] + audio_inputs + map_args + [
+        "-c:v", "h264_nvenc",
+        "-preset", preset,
+        "-rc", "constqp",
+        "-qp", crf,
+        "-force_key_frames", f"expr:gte(t,n_forced*{keyframe_interval})",
+        "-c:a", "aac",
+    ] + hls_args
+
+    print(f"Running FFmpeg (NVENC): {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+
+def _try_libx264(input_path, audio_inputs, map_args, hls_args, crf, keyframe_interval):
+    """Fallback to software encoding with libx264."""
+    cmd = [
+        "ffmpeg",
+        "-i", input_path,
+    ] + audio_inputs + map_args + [
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", crf,
+        "-force_key_frames", f"expr:gte(t,n_forced*{keyframe_interval})",
+        "-c:a", "aac",
+    ] + hls_args
+
+    print(f"Running FFmpeg (libx264 fallback): {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
 
 
 runpod.serverless.start({"handler": handler})
