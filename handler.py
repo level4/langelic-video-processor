@@ -28,6 +28,7 @@ def _process(event):
     job_input = event["input"]
 
     source_url = job_input["source_url"]
+    audio_url = job_input.get("audio_url")
     r2_config = job_input["r2"]
     ffmpeg_args = job_input.get("ffmpeg_args", {})
 
@@ -55,14 +56,33 @@ def _process(event):
         size_mb = os.path.getsize(input_path) / (1024 * 1024)
         print(f"Downloaded {size_mb:.1f}MB")
 
+        # 1b. Download separate audio if provided
+        audio_path = None
+        if audio_url:
+            audio_path = os.path.join(tmp_dir, "audio.m4a")
+            print("Downloading separate audio...")
+            try:
+                audio_resp = requests.get(audio_url, stream=True, timeout=3600)
+                audio_resp.raise_for_status()
+                with open(audio_path, "wb") as f:
+                    for chunk in audio_resp.iter_content(chunk_size=8 * 1024 * 1024):
+                        f.write(chunk)
+                audio_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+                print(f"Downloaded audio {audio_size_mb:.1f}MB")
+            except requests.RequestException as e:
+                return {"error": f"Audio download failed: {e}"}
+
         # 2. Re-encode with NVENC + output HLS segments
         stream_path = os.path.join(output_dir, "stream.m3u8")
         segment_pattern = os.path.join(output_dir, "segment_%03d.m4s")
+
+        audio_inputs = ["-i", audio_path] if audio_path else []
 
         cmd = [
             "ffmpeg",
             "-hwaccel", "cuda",
             "-i", input_path,
+        ] + audio_inputs + [
             "-c:v", "h264_nvenc",
             "-preset", preset,
             "-rc", "constqp",
