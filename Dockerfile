@@ -19,4 +19,4 @@ RUN pip install --no-cache-dir boto3 runpod
 # Copy handler
 COPY handler.py /handler.py
 
-CMD ["python3", "-u", "/handler.py"]
+CMD ["python3.11", "-u", "/handler.py"]
