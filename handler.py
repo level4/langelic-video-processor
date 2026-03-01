@@ -56,7 +56,7 @@ def _process(event):
         print(f"Downloaded {size_mb:.1f}MB")
 
         # 2. Re-encode with NVENC + output HLS segments
-        manifest_path = os.path.join(output_dir, "master.m3u8")
+        stream_path = os.path.join(output_dir, "stream.m3u8")
         segment_pattern = os.path.join(output_dir, "segment_%03d.m4s")
 
         cmd = [
@@ -74,8 +74,9 @@ def _process(event):
             "-hls_segment_type", "fmp4",
             "-hls_segment_filename", segment_pattern,
             "-hls_playlist_type", "vod",
+            "-master_pl_name", "master.m3u8",
             "-y",
-            manifest_path,
+            stream_path,
         ]
 
         print(f"Running FFmpeg: {' '.join(cmd)}")
