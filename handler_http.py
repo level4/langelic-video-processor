@@ -4,12 +4,16 @@ Wraps the same FFmpeg encoding logic as the RunPod handler.
 Accepts jobs via HTTP, reports status, and phones home on startup.
 """
 
+import json
 import os
 import glob
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 from s2_logger import S2Logger
@@ -267,9 +271,9 @@ def _process(job_input, logger):
 
 
 def _phone_home():
-    """Phone home to the app to announce readiness."""
-    if not CALLBACK_URL or not INSTANCE_ID:
-        print("No callback URL or instance ID configured, skipping phone home")
+    """Phone home to the app to announce readiness via S2 and HTTP callback."""
+    if not INSTANCE_ID:
+        print("No instance ID configured, skipping phone home")
         return
 
     # Detect our public IP
@@ -278,18 +282,73 @@ def _phone_home():
     except Exception:
         ip = "unknown"
 
-    print(f"Phoning home to {CALLBACK_URL} with IP {ip}")
+    # Phone home via S2 (works even when callback URL is unreachable)
+    _s2_phone_home(ip)
 
+    # Also try HTTP callback (works on staging/production)
+    if CALLBACK_URL:
+        print(f"Phoning home to {CALLBACK_URL} with IP {ip}")
+        try:
+            resp = requests.post(
+                f"{CALLBACK_URL}/api/internal/encoder/ready",
+                json={"instance_id": INSTANCE_ID, "ip": ip},
+                headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+                timeout=30,
+            )
+            print(f"Phone home response: {resp.status_code}")
+        except Exception as e:
+            print(f"Phone home via HTTP failed: {e}")
+
+
+def _s2_phone_home(ip):
+    """Write phone-home record to S2 stream instance/{INSTANCE_ID}."""
+    token = os.environ.get("S2_ACCESS_TOKEN")
+    basin = os.environ.get("S2_BASIN", "langelic")
+    if not token or not INSTANCE_ID:
+        print("[S2] No S2 token or instance ID, skipping S2 phone home")
+        return
+
+    stream = f"instance/{INSTANCE_ID}"
+    encoded_stream = urllib.parse.quote(stream, safe="")
+    base_url = f"https://{basin}.b.aws.s2.dev/v1"
+
+    # Create stream (ignore 409 if exists)
     try:
-        resp = requests.post(
-            f"{CALLBACK_URL}/api/internal/encoder/ready",
-            json={"instance_id": INSTANCE_ID, "ip": ip},
-            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
-            timeout=30,
+        body = json.dumps({"stream": stream}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/streams",
+            data=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
         )
-        print(f"Phone home response: {resp.status_code}")
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code != 409:
+            print(f"[S2] Failed to create phone-home stream: {e}")
+            return
     except Exception as e:
-        print(f"Phone home failed: {e}")
+        print(f"[S2] Failed to create phone-home stream: {e}")
+        return
+
+    # Append phone-home record
+    try:
+        record = {
+            "records": [{
+                "headers": [["type", "phone-home"]],
+                "body": json.dumps({"instance_id": INSTANCE_ID, "ip": ip}),
+            }]
+        }
+        body = json.dumps(record).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/streams/{encoded_stream}/records",
+            data=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        print(f"[S2] Phone home written to s2://{basin}/{stream} with IP {ip}")
+    except Exception as e:
+        print(f"[S2] Failed to write phone-home record: {e}")
 
 
 def _heartbeat_loop():
