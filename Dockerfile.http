@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+# Install FFmpeg from static builds (no GPU needed, CPU-only)
+RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils && \
+    wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz && \
+    tar xf ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz && \
+    cp ffmpeg-n7.1-latest-linux64-gpl-7.1/bin/ffmpeg /usr/local/bin/ffmpeg && \
+    cp ffmpeg-n7.1-latest-linux64-gpl-7.1/bin/ffprobe /usr/local/bin/ffprobe && \
+    rm -rf ffmpeg-n7.1-latest-linux64-gpl-7.1* && \
+    apt-get remove -y wget xz-utils && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir boto3 requests fastapi uvicorn pydantic
+
+# Copy handler
+COPY handler_http.py /handler_http.py
+
+EXPOSE 8000
+
+CMD ["python3", "-u", "/handler_http.py"]
