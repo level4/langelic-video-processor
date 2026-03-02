@@ -4,6 +4,7 @@ Wraps the same FFmpeg encoding logic as the RunPod handler.
 Accepts jobs via HTTP, reports status, and phones home on startup.
 """
 
+import concurrent.futures
 import json
 import os
 import glob
@@ -249,17 +250,29 @@ def _process(job_input, logger):
             ".mp4": "video/mp4",
         }
 
-        output_files = []
+        files_to_upload = []
         for filepath in sorted(glob.glob(os.path.join(output_dir, "*"))):
             filename = os.path.basename(filepath)
             key = prefix + filename
             ext = os.path.splitext(filename)[1]
             content_type = content_types.get(ext, "application/octet-stream")
+            files_to_upload.append((filepath, bucket, key, content_type))
 
-            logger.log(f"Uploading {key} ({content_type})")
-            s3.upload_file(filepath, bucket, key, ExtraArgs={"ContentType": content_type})
-            output_files.append(key)
+        logger.log(f"Uploading {len(files_to_upload)} files with 8 parallel threads...")
 
+        def upload_one(args):
+            fpath, bkt, key, ct = args
+            s3.upload_file(fpath, bkt, key, ExtraArgs={"ContentType": ct})
+            return key
+
+        output_files = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(upload_one, f): f for f in files_to_upload}
+            for future in concurrent.futures.as_completed(futures):
+                key = future.result()
+                output_files.append(key)
+
+        output_files.sort()
         manifest_key = prefix + "master.m3u8"
         logger.log(f"Upload complete: {len(output_files)} files, manifest: {manifest_key}")
 
