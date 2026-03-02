@@ -13,8 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils &
 # Install Python dependencies
 RUN pip install --no-cache-dir boto3 requests fastapi uvicorn pydantic
 
-# Copy handler
+# Copy handler and S2 logger
 COPY handler_http.py /handler_http.py
+COPY s2_logger.py /s2_logger.py
 
 EXPOSE 8000
 

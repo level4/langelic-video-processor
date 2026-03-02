@@ -12,6 +12,8 @@ import threading
 import time
 import uuid
 
+from s2_logger import S2Logger
+
 import boto3
 import requests
 from fastapi import FastAPI, HTTPException, Security
@@ -42,6 +44,7 @@ class JobInput(BaseModel):
     audio_url: Optional[str] = None
     r2: dict
     ffmpeg_args: Optional[dict] = {}
+    s2_stream: Optional[str] = None
 
 
 @app.get("/health")
@@ -86,23 +89,30 @@ def get_job(job_id: str, _=Security(verify_token)):
 
 def _run_encode(job_id, job_input):
     """Run the encode in a background thread."""
+    logger = S2Logger(stream=job_input.get("s2_stream"))
     try:
-        result = _process(job_input)
+        logger.log(f"Starting encode job {job_id}")
+        result = _process(job_input, logger)
 
         with job_lock:
             if "error" in result:
+                logger.log(f"Job failed: {result['error']}")
                 current_job["status"] = "failed"
                 current_job["error"] = result["error"]
             else:
+                logger.log(f"Job completed: {result.get('manifest_key')}")
                 current_job["status"] = "completed"
                 current_job["output"] = result
     except Exception as e:
+        logger.log(f"Job exception: {e}")
         with job_lock:
             current_job["status"] = "failed"
             current_job["error"] = str(e)
+    finally:
+        logger.close()
 
 
-def _process(job_input):
+def _process(job_input, logger):
     """Process video: download, encode, upload. Same logic as handler.py."""
     source_url = job_input["source_url"]
     audio_url = job_input.get("audio_url")
@@ -120,7 +130,7 @@ def _process(job_input):
         os.makedirs(output_dir)
 
         # 1. Download source video
-        print("Downloading source video...")
+        logger.log("Downloading source video...")
         try:
             response = requests.get(source_url, stream=True, timeout=3600)
             response.raise_for_status()
@@ -131,13 +141,13 @@ def _process(job_input):
             return {"error": f"Download failed: {e}"}
 
         size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        print(f"Downloaded {size_mb:.1f}MB")
+        logger.log(f"Downloaded {size_mb:.1f}MB")
 
         # 1b. Download separate audio if provided
         audio_path = None
         if audio_url:
             audio_path = os.path.join(tmp_dir, "audio.m4a")
-            print("Downloading separate audio...")
+            logger.log("Downloading separate audio...")
             try:
                 audio_resp = requests.get(audio_url, stream=True, timeout=3600)
                 audio_resp.raise_for_status()
@@ -177,14 +187,46 @@ def _process(job_input):
             "-c:a", "aac",
         ] + hls_args
 
-        print(f"Running FFmpeg: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        logger.log(f"Running FFmpeg: {' '.join(cmd)}")
 
-        if result.returncode != 0:
-            stderr_tail = result.stderr[-1000:] if result.stderr else "(no stderr)"
-            return {"error": f"FFmpeg failed with code {result.returncode}: {stderr_tail}"}
+        # Insert -progress pipe:1 before the HLS output args (last 2 args: -y and stream_path)
+        cmd_with_progress = cmd[:-2] + ["-progress", "pipe:1"] + cmd[-2:]
 
-        print("FFmpeg complete")
+        process = subprocess.Popen(
+            cmd_with_progress,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Parse FFmpeg progress output from stdout
+        progress_block = {}
+        for line in process.stdout:
+            line = line.strip()
+            if "=" in line:
+                key, _, value = line.partition("=")
+                progress_block[key] = value
+
+                if key == "progress":
+                    # End of a progress block
+                    if "out_time" in progress_block:
+                        logger.progress({
+                            "time": progress_block.get("out_time", "").strip(),
+                            "speed": progress_block.get("speed", "").strip(),
+                            "fps": progress_block.get("fps", "").strip(),
+                            "frame": progress_block.get("frame", "").strip(),
+                            "total_size": progress_block.get("total_size", "").strip(),
+                        })
+                    progress_block = {}
+
+        process.wait(timeout=7200)
+        stderr_output = process.stderr.read()
+
+        if process.returncode != 0:
+            stderr_tail = stderr_output[-1000:] if stderr_output else "(no stderr)"
+            return {"error": f"FFmpeg failed with code {process.returncode}: {stderr_tail}"}
+
+        logger.log("FFmpeg complete")
 
         # 3. Upload to R2
         s3 = boto3.client(
@@ -210,12 +252,12 @@ def _process(job_input):
             ext = os.path.splitext(filename)[1]
             content_type = content_types.get(ext, "application/octet-stream")
 
-            print(f"Uploading {key} ({content_type})")
+            logger.log(f"Uploading {key} ({content_type})")
             s3.upload_file(filepath, bucket, key, ExtraArgs={"ContentType": content_type})
             output_files.append(key)
 
         manifest_key = prefix + "master.m3u8"
-        print(f"Upload complete: {len(output_files)} files, manifest: {manifest_key}")
+        logger.log(f"Upload complete: {len(output_files)} files, manifest: {manifest_key}")
 
         return {
             "manifest_key": manifest_key,
